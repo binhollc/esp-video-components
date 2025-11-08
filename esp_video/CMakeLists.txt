@@ -51,6 +51,7 @@ if(CONFIG_ESP_VIDEO_ENABLE_ISP)
 
     if(CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER)
         list(APPEND srcs "src/esp_video_isp_pipeline.c")
+        list(APPEND srcs "src/esp_isp_stats.c")  # HAL-based ISP stats reader
     endif()
 endif()
 
@@ -65,6 +66,7 @@ cu_pkg_define_version(${CMAKE_CURRENT_LIST_DIR})
 
 if(CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER)
     idf_component_optional_requires(PRIVATE "esp_ipa")
+    idf_component_optional_requires(PRIVATE "hal")  # For ISP HAL access (isp_ll.h)
 endif()
 
  if(CONFIG_IDF_TARGET_ESP32P4)
