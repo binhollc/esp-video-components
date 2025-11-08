@@ -846,13 +846,12 @@ static esp_err_t imx708_set_analog_gain(esp_cam_sensor_device_t *dev, uint16_t g
     
     ESP_LOGD(TAG, "Setting analog gain to 0x%02X", gain);
     
-    // Write analog gain register (16-bit: 0x0204 high, 0x0205 low) under group hold
+    // Write analog gain register (16-bit: 0x0204 high, 0x0205 low)
+    // Note: Group hold is managed by caller (e.g. GROUP_EXP_GAIN handler)
     uint8_t gain_h = (gain >> 8) & 0xFF;
     uint8_t gain_l = (gain & 0xFF);
-    imx708_group_hold(dev, true);
     ret  = imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN,     gain_h);
     ret |= imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN + 1, gain_l);
-    imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.analog_gain = gain;
@@ -887,11 +886,10 @@ static esp_err_t imx708_set_digital_gain(esp_cam_sensor_device_t *dev, uint16_t 
     
     ESP_LOGD(TAG, "Setting digital gain to 0x%03X", gain);
     
-    // Write digital gain register (16-bit big-endian format) under group hold
-    imx708_group_hold(dev, true);
+    // Write digital gain register (16-bit big-endian format)
+    // Note: Group hold is managed by caller (e.g. GROUP_EXP_GAIN handler)
     ret = imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN, (gain >> 8) & 0xFF);
     ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN + 1, gain & 0xFF);
-    imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.digital_gain = gain;
@@ -1006,7 +1004,12 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
     }
 
     // Atomically program both gains (and any pending color balance) under group hold
-    imx708_group_hold(dev, true);
+    // Only apply group hold if we're not already inside one (managed by caller)
+    bool need_group_hold = (s_group_hold_depth == 0);
+    if (need_group_hold) {
+        imx708_group_hold(dev, true);
+    }
+    
     #if IMX708_FREEZE_ANALOG_GAIN
         // Do not touch analog gain when freezing
         ret  = imx708_set_digital_gain(dev, digital_gain);
@@ -1034,7 +1037,10 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
             
         }
     }
-    imx708_group_hold(dev, false);
+    
+    if (need_group_hold) {
+        imx708_group_hold(dev, false);
+    }
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.gain_val = total_gain;
@@ -1750,7 +1756,7 @@ static esp_err_t imx708_set_para_value(esp_cam_sensor_device_t *dev, uint32_t id
         ESP_RETURN_ON_FALSE(size == sizeof(esp_cam_sensor_gh_exp_gain_t), ESP_ERR_INVALID_SIZE, TAG, "Invalid size for GROUP_EXP_GAIN");
         {
             esp_cam_sensor_gh_exp_gain_t *value = (esp_cam_sensor_gh_exp_gain_t *)arg;
-            ESP_LOGD(TAG, "set_para_value: GROUP_EXP_GAIN exposure_us=%lu, gain_index=%lu", 
+            ESP_LOGI(TAG, "GROUP_EXP_GAIN: exposure_us=%lu, gain_index=%lu", 
                      value->exposure_us, value->gain_index);
 
             // Apply exposure and gain atomically via group hold to ensure clean transitions

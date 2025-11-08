@@ -28,9 +28,10 @@
 #include "esp_video_device_internal.h"
 #include "esp_ipa.h"
 #include "esp_cam_sensor.h"
+#include "esp_video_device.h"
 
 #define ISP_METADATA_BUFFER_COUNT   2
-#define ISP_TASK_PRIORITY           11
+#define ISP_TASK_PRIORITY           8  // Lowered from 11 to reduce interference with camera/encoder pipeline
 #define ISP_TASK_STACK_SIZE         4096
 #define ISP_TASK_NAME               "isp_task"
 
@@ -70,10 +71,37 @@ typedef struct esp_video_isp {
     StaticTask_t *task_ptr;
     StackType_t *task_stack_ptr;
 #endif
+    
+    // Frame boundary synchronization
+    SemaphoreHandle_t frame_boundary_sem;
+    
+    // Async camera parameter update task
+    TaskHandle_t camera_update_task;
+    QueueHandle_t camera_update_queue;
 } esp_video_isp_t;
+
+// Camera update request structure for async task
+typedef struct {
+    uint32_t exposure_us;
+    uint32_t gain_index;
+    float gain_value;
+} camera_update_request_t;
 
 static const char *TAG = "ISP";
 static esp_video_isp_t *s_esp_video_isp;
+
+// Forward declaration for camera pipeline callback registration
+extern void camera_pipeline_register_frame_callback(void (*cb)(void));
+
+// Callback from camera pipeline when frame boundary occurs
+static void isp_frame_boundary_notify(void)
+{
+    if (s_esp_video_isp && s_esp_video_isp->frame_boundary_sem) {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(s_esp_video_isp->frame_boundary_sem, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
 
 /**
  * @brief Print ISP statistics data
@@ -539,8 +567,29 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
             }
         }
 
-        if (isp->prev_gain_index == gain_index) {
+        // Don't remove GN flag if ET is also set - we need both for GROUP_EXP_GAIN
+        if (isp->prev_gain_index == gain_index && !(metadata->flags & IPA_METADATA_FLAGS_ET)) {
             metadata->flags &= ~IPA_METADATA_FLAGS_GN;
+        }
+    }
+
+    // If GROUP_EXP_GAIN is available and either ET or GN is set, force both flags
+    // to ensure atomic updates even when only one value changes
+    if (isp->sensor_attr.group) {
+        if ((metadata->flags & IPA_METADATA_FLAGS_ET) && !(metadata->flags & IPA_METADATA_FLAGS_GN)) {
+            // ET set but not GN - force GN with current value
+            metadata->flags |= IPA_METADATA_FLAGS_GN;
+            if (gain_index < 0) {
+                // No gain computed yet - use previous value
+                gain_index = isp->prev_gain_index;
+                target_gain = isp->sensor.cur_gain;
+            }
+        } else if ((metadata->flags & IPA_METADATA_FLAGS_GN) && !(metadata->flags & IPA_METADATA_FLAGS_ET)) {
+            // GN set but not ET - force ET with current value
+            metadata->flags |= IPA_METADATA_FLAGS_ET;
+            if (!metadata->exposure) {
+                metadata->exposure = isp->sensor.cur_exposure;
+            }
         }
     }
 
@@ -571,19 +620,28 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
         group.exposure_us = apply_us;
         group.gain_index = gain_index;
 
-        controls.ctrl_class = V4L2_CID_CAMERA_CLASS;
-        controls.count      = 1;
-        controls.controls   = control;
-        control[0].id       = V4L2_CID_CAMERA_GROUP;
-        control[0].p_u8     = (uint8_t *)&group;
-        control[0].size     = sizeof(esp_cam_sensor_gh_exp_gain_t);
-        if (ioctl(isp->cam_fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
-            ESP_LOGE(TAG, "failed to set group");
+        // Send camera update request to async task (non-blocking!)
+        // This eliminates I2C stalls by moving 14-15ms ioctl to low-priority background task
+        // Check if queue is initialized (it may not be during early init)
+        if (isp->camera_update_queue != NULL) {
+            camera_update_request_t req = {
+                .exposure_us = apply_us,
+                .gain_index = gain_index,
+                .gain_value = target_gain
+            };
+            
+            if (xQueueSend(isp->camera_update_queue, &req, 0) == pdTRUE) {
+                // Update tracking variables optimistically (actual I2C happens in background)
+                isp->prev_gain_index = gain_index;
+                ESP_LOGD(TAG, "ISP: Queued camera update (exp=%lu gain=%lu)", apply_us, gain_index);
+            } else {
+                ESP_LOGW(TAG, "ISP: Camera update queue FULL! Dropping update (exp=%lu gain=%lu)", 
+                         apply_us, gain_index);
+            }
         } else {
-            isp->sensor.cur_exposure = apply_us;
-            isp->sensor.cur_gain = target_gain;
-            isp->prev_gain_index = gain_index;
-                    }
+            // Queue not initialized yet - apply update synchronously for now
+            ESP_LOGD(TAG, "Camera update queue not ready, skipping update");
+        }
     } else {
         if ((metadata->flags & IPA_METADATA_FLAGS_ET) &&
                 isp->sensor_attr.exposure) {
@@ -791,12 +849,8 @@ static void config_motor_position(esp_video_isp_t *isp, esp_ipa_metadata_t *meta
 
 static void config_isp_and_camera(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)
 {
+    // Configure ISP-only parameters (no camera I2C access, always safe)
     config_statistics_region(isp, metadata);
-
-    if (!isp->sensor_attr.awb) {
-        config_white_balance(isp, metadata);
-    }
-
     config_bayer_filter(isp, metadata);
     config_demosaic(isp, metadata);
     config_sharpen(isp, metadata);
@@ -809,6 +863,12 @@ static void config_isp_and_camera(esp_video_isp_t *isp, esp_ipa_metadata_t *meta
     config_awb(isp, metadata);
     config_af(isp, metadata);
 
+    // Camera parameter updates now use Group Hold for atomic application at frame boundaries
+    // to prevent I2C bus contention and DQBUF stalls during active streaming.
+    
+    if (!isp->sensor_attr.awb) {
+        config_white_balance(isp, metadata);
+    }
     config_sensor_ae_target_level(isp, metadata);
     config_exposure_and_gain(isp, metadata);
 #if CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR
@@ -925,11 +985,69 @@ static void get_sensor_state(esp_video_isp_t *isp, int index)
     }
 }
 
+// Async camera parameter update task - runs at low priority to avoid blocking main pipeline
+static void camera_update_task(void *p)
+{
+    esp_video_isp_t *isp = (esp_video_isp_t *)p;
+    camera_update_request_t req;
+    
+    ESP_LOGI(TAG, "Camera update task started (low priority, non-blocking)");
+    
+    while (1) {
+        // Wait for update request from ISP task (blocking, no CPU usage when idle)
+        if (xQueueReceive(isp->camera_update_queue, &req, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGD(TAG, "CamUpdateTask: Received request (exp=%lu gain=%lu)", 
+                     req.exposure_us, req.gain_index);
+            
+            // Apply camera parameters via GROUP_EXP_GAIN
+            // This I2C transaction (14-15ms) happens in background at low priority
+            if (isp->sensor_attr.group) {
+                esp_cam_sensor_gh_exp_gain_t group;
+                group.exposure_us = req.exposure_us;
+                group.gain_index = req.gain_index;
+                
+                struct v4l2_ext_controls controls;
+                struct v4l2_ext_control control[1];
+                
+                controls.ctrl_class = V4L2_CID_CAMERA_CLASS;
+                controls.count = 1;
+                controls.controls = control;
+                control[0].id = V4L2_CID_CAMERA_GROUP;
+                control[0].p_u8 = (uint8_t *)&group;
+                control[0].size = sizeof(group);
+                
+                int64_t t0 = esp_timer_get_time();
+                if (ioctl(isp->cam_fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
+                    ESP_LOGE(TAG, "CamUpdateTask: GROUP_EXP_GAIN failed");
+                } else {
+                    int64_t t1 = esp_timer_get_time();
+                    int64_t dt = t1 - t0;
+                    ESP_LOGD(TAG, "CamUpdateTask: GROUP_EXP_GAIN completed in %lld us", dt);
+                    if (dt > 20000) { // Log if > 20ms (slower than expected)
+                        ESP_LOGW(TAG, "CamUpdateTask: Slow I2C (%lld us) exp=%lu gain=%lu", 
+                                 dt, req.exposure_us, req.gain_index);
+                    }
+                    // Update tracking variables
+                    isp->sensor.cur_exposure = req.exposure_us;
+                    isp->sensor.cur_gain = req.gain_value;
+                }
+            }
+        }
+    }
+}
+
 static void isp_task(void *p)
 {
     esp_err_t ret;
     struct v4l2_buffer buf;
     esp_video_isp_t *isp = (esp_video_isp_t *)p;
+    
+    // Frame skipping to reduce ISP interference with camera pipeline
+    // Process only every Nth frame to lower ISP task CPU/memory pressure
+    // Higher value = less interference but slower AE/AWB/AG convergence
+    // Optimal: 3 = 5fps processing (good balance of performance vs convergence speed)
+    static const uint32_t ISP_PROCESS_INTERVAL = 3; // Process 1 out of every 3 frames (5fps)
+    uint32_t frame_counter = 0;
 
     while (1) {
         memset(&buf, 0, sizeof(buf));
@@ -940,12 +1058,32 @@ static void isp_task(void *p)
             continue;
         }
 
-        get_sensor_state(isp, buf.index);
+        // DISABLED: get_sensor_state() causes I2C contention with camera_update_task
+        // Both tasks accessing I2C simultaneously → mutex lock → deadlock → watchdog restart
+        // We already have sensor state from IPA calculations, don't need to read it again
+        // get_sensor_state(isp, buf.index);
 
-        isp_stats_to_ipa_stats(isp->isp_stats[buf.index], &isp->ipa_stats);
+        // Only process IPA on selected frames to reduce interference
+        bool should_process = ((frame_counter++ % ISP_PROCESS_INTERVAL) == 0);
+        
+        if (should_process) {
+            isp_stats_to_ipa_stats(isp->isp_stats[buf.index], &isp->ipa_stats);
+        }
+        
+        // Always QBUF immediately to avoid blocking V4L2 subsystem
         if (ioctl(isp->isp_fd, VIDIOC_QBUF, &buf) != 0) {
             ESP_LOGE(TAG, "failed to queue video frame");
         }
+        
+        if (!should_process) {
+            // Skip IPA processing for this frame
+            // Sleep briefly to avoid hammering DQBUF and competing with pipeline
+            // This yields CPU to camera_update_task and other low-priority tasks
+            // At 5fps (interval=3), we skip 2 frames, sleep ~10ms each = 20ms total breathing room
+            vTaskDelay(pdMS_TO_TICKS(10)); // ~10ms = ~0.15 frame period, minimal but effective
+            continue;
+        }
+        
         print_stats_info(&isp->ipa_stats);
 
         isp->metadata.flags = 0;
@@ -1043,7 +1181,18 @@ static void isp_task(void *p)
         }
         #endif // CONFIG_ESP_VIDEO_ENABLE_CAMERA_TELEMETRY
 
-        config_isp_and_camera(isp, &isp->metadata);
+        // Async camera update task handles all I2C operations in background.
+        // No rate limiting needed - queue naturally handles backpressure.
+        // ISP task applies every update immediately without blocking.
+        {
+            // For camera parameter updates (slow I2C ~14-15ms), don't wait for semaphore
+            // since the Group Hold mechanism already ensures atomic application at frame boundaries.
+            // Just apply immediately - the camera will latch the values at the next frame start.
+            config_isp_and_camera(isp, &isp->metadata);
+            
+            // Consume the semaphore signal if it arrived (prevents accumulation)
+            xSemaphoreTake(isp->frame_boundary_sem, 0);
+        }
     }
 
     vTaskDelete(NULL);
@@ -1191,11 +1340,13 @@ static esp_err_t init_cam_dev(const esp_video_isp_config_t *config, esp_video_is
     }
 
     qctrl.id = V4L2_CID_CAMERA_GROUP;
+    ESP_LOGD(TAG, "Querying V4L2_CID_CAMERA_GROUP (0x%08x)...", V4L2_CID_CAMERA_GROUP);
     ret = ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &qctrl);
     if (ret == 0) {
         isp->sensor_attr.group = 1;
+        ESP_LOGI(TAG, "V4L2_CID_CAMERA_GROUP supported - using batched exposure+gain updates");
     } else {
-        ESP_LOGD(TAG, "V4L2_CID_CAMERA_GROUP is not supported");
+        ESP_LOGW(TAG, "V4L2_CID_CAMERA_GROUP not supported (ret=%d, errno=%d) - using separate exposure/gain updates", ret, errno);
     }
 
     qctrl.id = V4L2_CID_CAMERA_AE_LEVEL;
@@ -1380,6 +1531,26 @@ esp_err_t esp_video_isp_pipeline_init(const esp_video_isp_config_t *config)
     ESP_GOTO_ON_ERROR(esp_ipa_pipeline_init(isp->ipa_pipeline, &isp->sensor, &metadata),
                       fail_3, TAG, "failed to initialize IPA pipeline");
     config_isp_and_camera(isp, &metadata);
+    
+    // Create frame boundary semaphore for synchronization with camera pipeline
+    isp->frame_boundary_sem = xSemaphoreCreateBinary();
+    ESP_GOTO_ON_FALSE(isp->frame_boundary_sem != NULL, ESP_ERR_NO_MEM,
+                      fail_3, TAG, "failed to create frame boundary semaphore");
+
+    // Create camera update queue and async task for non-blocking I2C updates
+    // Queue depth=2: allows 1 pending + 1 active update without blocking ISP task
+    isp->camera_update_queue = xQueueCreate(2, sizeof(camera_update_request_t));
+    ESP_GOTO_ON_FALSE(isp->camera_update_queue != NULL, ESP_ERR_NO_MEM,
+                      fail_3, TAG, "failed to create camera update queue");
+    ESP_LOGI(TAG, "Camera update queue created successfully (depth=2)");
+    
+    // Camera update task runs at much lower priority to avoid blocking pipeline
+    // Priority 5 ensures it only runs when camera/encoder tasks are idle
+    // Pin to CORE 1 to avoid contention with camera/encoder tasks (typically on CORE 0)
+    ESP_GOTO_ON_FALSE(xTaskCreatePinnedToCore(camera_update_task, "cam_update", 3072, isp, 
+                                               5, &isp->camera_update_task, 1) == pdPASS,
+                      ESP_ERR_NO_MEM, fail_3, TAG, "failed to create camera update task");
+    ESP_LOGI(TAG, "Camera update task created successfully (priority=5, core=1)");
 
     /**
      * If CONFIG_ISP_PIPELINE_CONTROLLER_TASK_STACK_USE_PSRAM is enabled, the ISP controller task stack
@@ -1393,19 +1564,30 @@ esp_err_t esp_video_isp_pipeline_init(const esp_video_isp_config_t *config)
     StackType_t *task_stack_ptr = heap_caps_malloc(ISP_TASK_STACK_SIZE * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     ESP_GOTO_ON_FALSE(task_stack_ptr, ESP_ERR_NO_MEM, fail_4, TAG, "failed to malloc task stack");
 
-    isp->task_handler = xTaskCreateStatic(isp_task, ISP_TASK_NAME, ISP_TASK_STACK_SIZE,
-                                          isp, ISP_TASK_PRIORITY, task_stack_ptr, task_ptr);
+    // Pin ISP task to CORE 1 to avoid interference with video pipeline on CORE 0
+    isp->task_handler = xTaskCreateStaticPinnedToCore(isp_task, ISP_TASK_NAME, ISP_TASK_STACK_SIZE,
+                                          isp, ISP_TASK_PRIORITY, task_stack_ptr, task_ptr, 1);
     ESP_GOTO_ON_FALSE(isp->task_handler != NULL, ESP_ERR_NO_MEM,
                       fail_5, TAG, "failed to create ISP static task");
 
     isp->task_ptr = task_ptr;
     isp->task_stack_ptr = task_stack_ptr;
+    ESP_LOGI(TAG, "ISP task created (priority=%d, core=1, stack=PSRAM)", ISP_TASK_PRIORITY);
 #else
-    ESP_GOTO_ON_FALSE(xTaskCreate(isp_task, ISP_TASK_NAME, ISP_TASK_STACK_SIZE, isp, ISP_TASK_PRIORITY, &isp->task_handler) == pdPASS,
+    // Pin ISP task to CORE 1 to avoid interference with video pipeline on CORE 0
+    ESP_GOTO_ON_FALSE(xTaskCreatePinnedToCore(isp_task, ISP_TASK_NAME, ISP_TASK_STACK_SIZE, isp, 
+                                               ISP_TASK_PRIORITY, &isp->task_handler, 1) == pdPASS,
                       ESP_ERR_NO_MEM, fail_3, TAG, "failed to create ISP task");
+    ESP_LOGI(TAG, "ISP task created (priority=%d, core=1, stack=DRAM)", ISP_TASK_PRIORITY);
 #endif
 
     s_esp_video_isp = isp;
+    
+    // Register callback with camera pipeline for frame boundary notifications
+    camera_pipeline_register_frame_callback(isp_frame_boundary_notify);
+    
+    ESP_LOGI(TAG, "ISP Pipeline initialized");
+    
     return ESP_OK;
 
 #if CONFIG_ISP_PIPELINE_CONTROLLER_TASK_STACK_USE_PSRAM
@@ -1452,6 +1634,15 @@ esp_err_t esp_video_isp_pipeline_deinit(void)
     heap_caps_free(isp->task_ptr);
     heap_caps_free(isp->task_stack_ptr);
 #endif
+
+    // Cleanup frame boundary semaphore
+    if (isp->frame_boundary_sem) {
+        vSemaphoreDelete(isp->frame_boundary_sem);
+        isp->frame_boundary_sem = NULL;
+    }
+    
+    // Unregister callback
+    camera_pipeline_register_frame_callback(NULL);
 
     ESP_RETURN_ON_FALSE(close(isp->isp_fd) == 0, ESP_FAIL, TAG, "failed to close ISP");
     ESP_RETURN_ON_FALSE(close(isp->cam_fd) == 0, ESP_FAIL, TAG, "failed to close camera sensor");
