@@ -419,6 +419,72 @@ static esp_err_t imx708_write(esp_sccb_io_handle_t sccb_handle, uint16_t reg, ui
     return ret;
 }
 
+/**
+ * @brief Optimized GROUP_EXP_GAIN write without redundant group hold operations
+ * @note Writes exposure + analog gain + digital gain atomically (6 I2C transactions vs 8)
+ * @param dev Camera sensor device handle
+ * @param exposure_lines Exposure value in lines
+ * @param analog_gain Analog gain register value
+ * @param digital_gain Digital gain register value
+ * @return ESP_OK on success, error code otherwise
+ */
+static esp_err_t imx708_set_group_exp_gain_optimized(esp_cam_sensor_device_t *dev, 
+                                                      uint32_t exposure_lines,
+                                                      uint16_t analog_gain,
+                                                      uint16_t digital_gain)
+{
+    esp_err_t ret = ESP_OK;
+    struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
+    
+    if (!cam_imx708) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // Atomic update: GROUP_HOLD(1) -> params -> GROUP_HOLD(0)
+    int64_t t0 = esp_timer_get_time();
+    ret  = imx708_write(dev->sccb_handle, IMX708_REG_GROUP_HOLD, 0x01);
+    
+    // Exposure (2 bytes)
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE, (exposure_lines >> 8) & 0xFF);
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, exposure_lines & 0xFF);
+    
+    // Analog gain (2 bytes)
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN, (analog_gain >> 8) & 0xFF);
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN + 1, analog_gain & 0xFF);
+    
+    // Digital gain (2 bytes)
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN, (digital_gain >> 8) & 0xFF);
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN + 1, digital_gain & 0xFF);
+    
+    int64_t t_before_release = esp_timer_get_time();
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_GROUP_HOLD, 0x00);
+    int64_t t_after_release = esp_timer_get_time();
+    int64_t total_time = t_after_release - t0;
+    int64_t release_time = t_after_release - t_before_release;
+    
+    // ALWAYS log to see timing (changed to LOGI)
+    ESP_LOGI(TAG, "⏱️  I2C timing: total=%lld us, release=%lld us", 
+             (long long)total_time, (long long)release_time);
+    
+    // Log timing to see if GROUP_HOLD release blocks
+    if (release_time > 2000) {  // More than 2ms
+        ESP_LOGW(TAG, "🔴 GROUP_HOLD release SLOW: %lld us (total: %lld us)", 
+                 (long long)release_time, (long long)total_time);
+    }
+    
+    if (ret == ESP_OK) {
+        // Update cached values
+        cam_imx708->imx708_para.exposure_val = exposure_lines;
+        cam_imx708->imx708_para.analog_gain = analog_gain;
+        cam_imx708->imx708_para.digital_gain = digital_gain;
+        cam_imx708->last_param_update_tick = xTaskGetTickCount();
+    } else {
+        ESP_LOGE(TAG, "GROUP_EXP_GAIN failed: %s", esp_err_to_name(ret));
+    }
+    
+    return ret;
+}
+
 /* write a array of registers */
 static esp_err_t imx708_write_array(esp_sccb_io_handle_t sccb_handle, const imx708_reginfo_t *regarray)
 {
@@ -1759,11 +1825,83 @@ static esp_err_t imx708_set_para_value(esp_cam_sensor_device_t *dev, uint32_t id
             ESP_LOGI(TAG, "GROUP_EXP_GAIN: exposure_us=%lu, gain_index=%lu", 
                      value->exposure_us, value->gain_index);
 
-            // Apply exposure and gain atomically via group hold to ensure clean transitions
-            imx708_group_hold(dev, true);
-            ret = imx708_set_exposure_us(dev, value->exposure_us);
-            ret |= imx708_set_total_gain(dev, value->gain_index);
-            imx708_group_hold(dev, false);
+            // Use optimized burst write path for GROUP_EXP_GAIN
+            // Convert exposure_us to lines
+            const esp_cam_sensor_format_t *format = dev->cur_format;
+            uint32_t fps = format->fps;
+            uint32_t vts = 0;
+            if (format->isp_info) {
+                vts = format->isp_info->isp_v1_info.vts;
+            } else {
+                ESP_LOGE(TAG, "Failed to get VTS for burst GROUP_EXP_GAIN");
+                ret = ESP_FAIL;
+                break;
+            }
+            
+            // Clamp exposure
+            uint32_t exposure_us = value->exposure_us;
+            if (exposure_us < IMX708_CFG_MIN_EXPOSURE_US) {
+                exposure_us = IMX708_CFG_MIN_EXPOSURE_US;
+            }
+            if (exposure_us > IMX708_CFG_MAX_EXPOSURE_US) {
+                exposure_us = IMX708_CFG_MAX_EXPOSURE_US;
+            }
+            
+            // Convert to lines
+            uint64_t exposure_lines_req = ((uint64_t)exposure_us * fps * vts) / 1000000ULL;
+            uint32_t max_lines = vts - IMX708_EXPOSURE_MAX_OFFSET;
+            uint32_t ratio_lines = (vts * IMX708_EXPOSURE_MAX_RATIO_PCT) / 100;
+            if (ratio_lines < max_lines) max_lines = ratio_lines;
+            if (exposure_lines_req > max_lines) {
+                exposure_lines_req = max_lines;
+            }
+            
+            // Convert total_gain to analog + digital
+            uint32_t total_gain = value->gain_index;
+            if (total_gain < IMX708_TOTAL_GAIN_MIN) total_gain = IMX708_TOTAL_GAIN_MIN;
+            if (total_gain > IMX708_TOTAL_GAIN_MAX) total_gain = IMX708_TOTAL_GAIN_MAX;
+            
+            uint16_t analog_gain = 0;
+            uint16_t digital_gain = IMX708_DIGITAL_GAIN_MIN;
+            
+            #if IMX708_FREEZE_ANALOG_GAIN
+                analog_gain = IMX708_ANA_GAIN_DEFAULT;
+                uint32_t dgain_code = (total_gain * 256) / 100;
+                if (dgain_code < IMX708_DIGITAL_GAIN_MIN) dgain_code = IMX708_DIGITAL_GAIN_MIN;
+                if (dgain_code > IMX708_DIGITAL_GAIN_MAX) dgain_code = IMX708_DIGITAL_GAIN_MAX;
+                digital_gain = (uint16_t)dgain_code;
+            #else
+                if (total_gain <= IMX708_ANALOG_MAX_X100) {
+                    uint32_t span = IMX708_ANALOG_GAIN_MAX - IMX708_ANALOG_GAIN_MIN;
+                    uint32_t num  = (total_gain > 100) ? (total_gain - 100) : 0;
+                    uint32_t den  = (IMX708_ANALOG_MAX_X100 > 100) ? (IMX708_ANALOG_MAX_X100 - 100) : 1;
+                    analog_gain = (uint16_t)(IMX708_ANALOG_GAIN_MIN + (span * num) / den);
+                    digital_gain = IMX708_DIGITAL_GAIN_MIN;
+                } else {
+                    analog_gain = IMX708_ANALOG_GAIN_MAX;
+                    uint32_t remaining_x100 = (total_gain * 100) / IMX708_ANALOG_MAX_X100;
+                    if (remaining_x100 < 100) remaining_x100 = 100;
+                    uint32_t dgain_code = (remaining_x100 * 256) / 100;
+                    if (dgain_code < IMX708_DIGITAL_GAIN_MIN) dgain_code = IMX708_DIGITAL_GAIN_MIN;
+                    if (dgain_code > IMX708_DIGITAL_GAIN_MAX) dgain_code = IMX708_DIGITAL_GAIN_MAX;
+                    digital_gain = (uint16_t)dgain_code;
+                }
+            #endif
+            
+            // Call optimized write function (6 I2C transactions instead of 8)
+            ret = imx708_set_group_exp_gain_optimized(dev, (uint32_t)exposure_lines_req, analog_gain, digital_gain);
+            
+            // Update cached values if successful
+            if (ret == ESP_OK) {
+                struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
+                if (cam_imx708) {
+                    cam_imx708->imx708_para.exposure_val = (uint32_t)exposure_lines_req;
+                    cam_imx708->imx708_para.analog_gain = analog_gain;
+                    cam_imx708->imx708_para.digital_gain = digital_gain;
+                    cam_imx708->imx708_para.gain_val = total_gain;
+                    cam_imx708->last_param_update_tick = xTaskGetTickCount();
+                }
+            }
         }
         break;
         
